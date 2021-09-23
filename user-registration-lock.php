@@ -21,7 +21,10 @@
  * License URI:       http://www.gnu.org/licenses/gpl-2.0.txt
  * Text Domain:       user-registration-lock
  * Domain Path:       /languages
- * Requires PHP:      5.6
+ * Requires at least: 4.8
+ * Requires PHP:      5.4
+ *
+ * @todo              Add notification class to email and log monitored changes.
  */
 
 /*
