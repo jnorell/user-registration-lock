@@ -149,9 +149,18 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 				add_action( 'admin_enqueue_scripts', [ $this, 'admin_enqueue_scripts' ] );
 			}
 
+			// add unprivileged role to be the default
+			$this->add_role();
+
 			// enforce user registration lock via option filters
 			$this->enable_option_filters();
 
+			// filter user data to prevent new users from being created
+			add_filter( 'wp_pre_insert_user_data', [ $this, 'wp_pre_insert_user_data' ], PHP_INT_MAX, 4 );
+
+			// filter usermeta data to prevent capabilities and user_level from changing 
+			add_filter( 'insert_user_meta', [ $this, 'insert_user_meta' ], PHP_INT_MAX, 4 );
+			add_filter( 'update_user_metadata', [ $this, 'update_user_metadata' ], PHP_INT_MAX, 4 );
 		}
 
 		/**
@@ -231,8 +240,13 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 				user_login varchar(60) NOT NULL DEFAULT '',
 				user_pass varchar(255) NOT NULL DEFAULT '',
 				user_email varchar(100) NOT NULL DEFAULT '',
-				capabilities longtext,
-				user_level longtext,
+				user_registered datetime NOT NULL DEFAULT '0000-00-00 00:00:00',
+				user_roles longtext,
+				user_caps longtext,
+				user_allcaps longtext,
+				meta_capabilities longtext,
+				meta_user_level longtext,
+				meta_use_ssl longtext,
 				PRIMARY KEY  (id)
 			) $charset_collate;";
 
@@ -245,13 +259,41 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 		/**
 		 * Copy information from current users to our save_users table.
 		 *
+		 * @todo     should also monitor and prevent changes to $user->site_id:WP_User:private or $meta['_new_email'] ?
+		 * @todo     monitor attempts to disable wordfence 2fa?
+		 *
 		 * @since    1.0.0
 		 * @access   protected
 		 */
 		protected function save_users() {
 			global $wpdb;
 
-			//fixme: finish function
+			// loop through all users
+			$users = get_users();
+			foreach ( $users as $user ) {
+				$meta = get_user_meta( $user->ID );
+				// these are arrays with single element:
+				$meta_capabilities = isset( $meta[ $GLOBALS['wpdb']->prefix.'capabilities' ] ) ? $meta[ $GLOBALS['wpdb']->prefix.'capabilities' ][0] : '';
+				$meta_user_level = isset( $meta[ $GLOBALS['wpdb']->prefix.'user_level' ] ) ?  $meta[ $GLOBALS['wpdb']->prefix.'user_level' ][0] : '';
+				$meta_use_ssl = isset( $meta['use_ssl'] ) ?  $meta['use_ssl'][0] : '';
+
+				$save_user = [
+					'user_login' => $user->user_login,
+					'user_id' => $user->ID,
+					'user_pass' => $user->user_pass,
+					'user_email' => $user->user_email,
+					'user_registered' => $user->user_registered,
+					'user_roles' => json_encode( $user->roles ),
+					'user_caps' => json_encode( $user->caps ),
+					'user_allcaps' => json_encode( $user->allcaps ),
+					'meta_capabilities' => $meta_capabilities,
+					'meta_user_level' => $meta_user_level,
+					'meta_use_ssl' => $meta_use_ssl,
+				];
+
+				// insert requires raw data, no escaping
+				$wpdb->insert( $this->table_save_users, $save_user );
+			}
 		}
 
 		/**
@@ -281,13 +323,35 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			    // do updates for 2.3.4
 			    $updated_to = '2.3.4';
 			}
-			*/
+			 */
 
 			if ( version_compare( $updated_to, $this->version ) < 0 ) {
 				$updated_to = $this->version;
 			}
 
 			User_Registration_Lock_Options::update_option( 'version', $updated_to );
+		}
+
+		/**
+		 * Add unprivileged role to be set as the default
+		 *
+		 * @since   1.0.0
+		 */
+		public function add_role() {
+			add_role(
+				$this->plugin_name,
+				__( 'User Registration Locked', 'user-registration-lock' ),
+				[]
+			);
+		}
+
+		/**
+		 * Remove unprivileged role added by add_role()
+		 *
+		 * @since   1.0.0
+		 */
+		public function remove_role() {
+			remove_role( $this->plugin_name );
 		}
 
 		/**
@@ -333,7 +397,217 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 		 * @since   1.0.0
 		 */
 		public function filter_option_default_role() {
-			return 'subscriber';
+			// default role is now the unprivileged role we created
+			return $this->plugin_name;
+		}
+
+		/**
+		 * Filter user data to prevent new users from being created and disallowed changes
+		 *
+		 * @todo:   looks like we could check $usermeta['role'], though only in 5.8
+		 *
+		 * @since   1.0.0
+		 *
+		 * @param array    $data {
+		 *     Values and keys for the user.
+		 *
+		 *     @type string $user_login      The user's login. Only included if $update == false
+		 *     @type string $user_pass       The user's password.
+		 *     @type string $user_email      The user's email.
+		 *     @type string $user_url        The user's url.
+		 *     @type string $user_nicename   The user's nice name. Defaults to a URL-safe version of user's login
+		 *     @type string $display_name    The user's display name.
+		 *     @type string $user_registered MySQL timestamp describing the moment when the user registered. Defaults to
+		 *                                   the current UTC timestamp.
+		 * }
+		 * @param bool     $update   Whether the user is being updated rather than created.
+		 * @param int|null $id       ID of the user to be updated, or NULL if the user is being created.
+		 * @param array    $userdata The raw array of data passed to wp_insert_user().
+		 */
+		public function wp_pre_insert_user_data( $data, $update, $id, $userdata ) {
+			// new users cannot be added
+			if ( is_null( $id ) ) {
+				// @todo notify admin
+				return false;
+			}
+
+			$save_user = $this->get_saved_userdata( $id );
+
+			// no data saved for this user when User Registration Lock was enabled
+			if ( ! is_array( $save_user ) ) {
+				// @todo notify admin
+				return false;
+			}
+
+			// existing users cannot change id, login, email or registered date
+			if ( isset( $data['user_login'] ) && $data['user_login'] != $save_user['user_login'] ) {
+				// @todo notify admin
+				return false;
+			}
+			if ( isset( $data['user_email'] ) && $data['user_email'] != $save_user['user_email'] ) {
+				// @todo notify admin
+				return false;
+			}
+			if ( isset( $data['user_registered'] ) && $data['user_registered'] != $save_user['user_registered'] ) {
+				// @todo notify admin
+				return false;
+			}
+
+			// we allow but notify of password changes
+			if ( isset( $data['user_pass'] ) && $data['user_pass'] != $save_user['user_pass'] ) {
+				// @todo notify admin
+			}
+
+			return $data;
+		}
+
+		/**
+		 * Filter user metadata to prohibit lowering of use_ssl
+		 *
+		 * This filter could probably be bypassed, the only meta of interest available here is use_ssl,
+		 * which is also available in update_user_metadata.
+		 *
+		 * @since   1.0.0
+		 *
+		 * @param array $meta {
+		 *     Default meta values and keys for the user.
+		 *
+		 *     @type string   $nickname             The user's nickname. Default is the user's username.
+		 *     @type string   $first_name           The user's first name.
+		 *     @type string   $last_name            The user's last name.
+		 *     @type string   $description          The user's description.
+		 *     @type string   $rich_editing         Whether to enable the rich-editor for the user. Default 'true'.
+		 *     @type string   $syntax_highlighting  Whether to enable the rich code editor for the user. Default 'true'.
+		 *     @type string   $comment_shortcuts    Whether to enable keyboard shortcuts for the user. Default 'false'.
+		 *     @type string   $admin_color          The color scheme for a user's admin screen. Default 'fresh'.
+		 *     @type int|bool $use_ssl              Whether to force SSL on the user's admin area. 0|false if SSL
+		 *                                          is not forced.
+		 *     @type string   $show_admin_bar_front Whether to show the admin bar on the front end for the user.
+		 *                                          Default 'true'.
+		 *     @type string   $locale               User's locale. Default empty.
+		 * }
+		 * @param WP_User $user     User object.
+		 * @param bool    $update   Whether the user is being updated rather than created.
+		 * @param array   $userdata The raw array of data passed to wp_insert_user().
+		 */
+		public function insert_user_meta( $meta, $user, $update, $userdata ) {
+			// new users cannot be added, so their usermeta won't be either
+			if ( is_null( $update ) ) {
+				// @todo notify admin
+				return false;
+			}
+
+			$save_user = $this->get_saved_userdata( $user->ID );
+
+			// no data saved for this user when User Registration Lock was enabled
+			if ( ! is_array( $save_user ) ) {
+				// @todo notify admin
+				return false;
+			}
+
+			// cannot disable use_ssl
+			if ( $save_user['meta_use_ssl'] && ! $meta['use_ssl'] ) {
+				// @todo notify admin
+				unset( $meta['use_ssl'] );
+			}
+
+			return $meta;
+		}
+
+		/**
+		 * Filter user metadata to prohibit lowering of use_ssl, adding administrator
+		 * capability or setting user_level to 10 (admin).
+		 *
+		 * @since   1.0.0
+		 *
+		 * @param null|bool $check      Whether to allow updating metadata for the given type.
+		 * @param int       $object_id  ID of the object metadata is for.
+		 * @param string    $meta_key   Metadata key.
+		 * @param mixed     $meta_value Metadata value. Must be serializable if non-scalar.
+		 * @param mixed     $prev_value Optional. Previous value to check before updating.
+		 *                              If specified, only update existing metadata entries with
+		 *                              this value. Otherwise, update all entries.
+		 */
+		public function update_user_metadata( $check, $object_id, $meta_key, $meta_value ) {
+
+			$save_user = $this->get_saved_userdata( $object_id );
+
+			// no data saved for this user when User Registration Lock was enabled
+			if ( ! is_array( $save_user ) ) {
+				// @todo notify admin
+				return false;
+			}
+
+			// prohibit changing to administrator from non-admin in meta_capabilities,
+			// and notify of all other changes.  doesn't handle a renamed 'administrator' role.
+			$key = $GLOBALS['wpdb']->prefix . 'capabilities';
+			if ( $meta_key == $key ) {
+				if ( is_array( $meta_value ) && isset( $meta_value['administrator'] ) ) {
+
+					// Don't really want to unserialize $save_user['meta_capabilities'],
+					// so we'll just treat as a string and match literal "administrator"
+					if ( ! (str_contains( $save_user['meta_capabilities'], '"administrator"' ) ||
+						str_contains( $save_user['meta_capabilities'], "'administrator'" ) ) )
+					{
+						// @todo notify admin
+						return false;
+					}
+
+				}
+			}
+
+			// prohibit user_level change from <10 to 10
+			$key = $GLOBALS['wpdb']->prefix . 'user_level';
+			if ( $meta_key == $key ) {
+				// monitor for change of user_level
+				if ( $meta_value != $save_user['meta_user_level'] ) {
+					// @todo notify admin
+				}
+				// cannot increase user_level
+				if ( 10 == $meta_value && 10 > $save_user['meta_user_level'] ) {
+					// @todo notify admin
+					return false;
+				}
+			}
+
+			// prohibit unsetting use_ssl
+			if ( $meta_key == 'use_ssl' ) {
+				if ( $save_user['meta_use_ssl'] && ! $meta_value ) {
+					// @todo notify admin
+					return false;
+				}
+			}
+
+			return $check;
+		}
+
+		/**
+		 * Retrieve saved user data
+		 *
+		 * @since   1.0.0
+		 * @access protected
+		 *
+		 * @param  mixed  $id The id of the user whose data to retrieve or an instance of WP_User.
+		 * @return mixed    Array of saved user data if found, otherwise false.
+		 */
+		protected function get_saved_userdata( $id ) {
+			global $wpdb;
+
+			if ( $id instanceof WP_User ) {
+				$id = $id->ID;
+			}
+
+			$save_user = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$this->table_save_users} WHERE user_id=%d", $id ), ARRAY_A );
+
+			if ( is_array( $save_user ) ) {
+				$save_user['user_roles'] = json_decode( $save_user['user_roles'] );
+				$save_user['user_caps'] = json_decode( $save_user['user_caps'] );
+				$save_user['user_allcaps'] = json_decode( $save_user['user_allcaps'] );
+			} else {
+				return false;
+			}
+
+			return $save_user;
 		}
 
 		/**
@@ -440,7 +714,7 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			}
 
 			# read users and check for monitored or disallowed changes
-			// @todo
+			// @todo @fixme
 		}
 
 		/**
@@ -455,8 +729,10 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 				return;
 			}
 
+	    /* Currently not needed
 			wp_register_style( 'user-registration-lock-admin-css', plugin_dir_url( USER_REGISTRATION_LOCK_PLUGIN_BASE ) . 'admin/css/user-registration-lock.css', false, $this->get_version() );
 			wp_enqueue_style( 'user-registration-lock-admin-css' );
+	     */
 
 			wp_register_script( 'user-registration-lock-admin-js', plugin_dir_url( USER_REGISTRATION_LOCK_PLUGIN_BASE ) . 'admin/js/user-registration-lock.js', array( 'jquery' ), $this->get_version(), true );
 
@@ -467,7 +743,6 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			);
 
 			wp_enqueue_script( 'user-registration-lock-admin-js' );
-
 		}
 
 		/**
@@ -524,6 +799,9 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 
 			// disable our filters first, or the upcoming update_options fail
 			$this->disable_option_filters();
+
+			// remove the unprivileged role we created
+			$this->remove_role();
 
 			// Restore old options
 			User_Registration_Lock_Options::set_option_name( $this->plugin_name );
