@@ -296,6 +296,40 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			}
 		}
 
+
+		/**
+		 * Update a row in our save_users table.
+		 *
+		 * @since    1.0.0
+		 * @access   protected
+		 *
+		 * @param   array   $save_user  The data to save.  Must contain an 'id' for the row to be updated.
+		 * @param   boolean $encode     Whether to json_encode the user_roles, user_caps and user_allcaps columns.
+		 * @return  mixed   The number of rows updated (should be 1) or false on error.
+		 */
+		protected function update_saved_userdata( $save_user, $encode=false ) {
+			global $wpdb;
+
+			if ( isset( $save_user['id'] ) ) {
+				$id = $save_user['id'];
+				unset( $save_user['id'] );
+
+				if ( isset( $save_user['user_roles'] ) ) {
+					$save_user['user_roles'] = json_encode( $save_user['user_roles'] );
+				}
+				if ( isset( $save_user['user_caps'] ) ) {
+					$save_user['user_caps'] = json_encode( $save_user['user_caps'] );
+				}
+				if ( isset( $save_user['user_allcaps'] ) ) {
+					$save_user['user_allcaps'] = json_encode( $save_user['user_allcaps'] );
+				}
+
+				return $wpdb->update( $this->table_save_users, $save_user, [ 'id' => $id ] );
+			} else {
+				return false;
+			}
+		}
+
 		/**
 		 * Perform needed updates from previous versions and store current version number.
 		 *
@@ -491,6 +525,8 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 		 * @param array   $userdata The raw array of data passed to wp_insert_user().
 		 */
 		public function insert_user_meta( $meta, $user, $update, $userdata ) {
+			global $wpdb;
+
 			// new users cannot be added, so their usermeta won't be either
 			if ( is_null( $update ) ) {
 				// @todo notify admin
@@ -509,6 +545,8 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			if ( $save_user['meta_use_ssl'] && ! $meta['use_ssl'] ) {
 				// @todo notify admin
 				unset( $meta['use_ssl'] );
+			} else if ( $save_user['meta_use_ssl'] != $meta['use_ssl'] ) {
+				$wpdb->update( $this->table_save_users, $save_user, [ 'user_id' => $user->ID ] );
 			}
 
 			return $meta;
@@ -529,6 +567,7 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 		 *                              this value. Otherwise, update all entries.
 		 */
 		public function update_user_metadata( $check, $object_id, $meta_key, $meta_value ) {
+			global $wpdb;
 
 			$save_user = $this->get_saved_userdata( $object_id );
 
@@ -554,19 +593,19 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 					}
 
 				}
+				$wpdb->update( $this->table_save_users, [ 'meta_capabilities' => serialize( $meta_value ) ], [ 'user_id' => $object_id ] );
 			}
 
 			// prohibit user_level change from <10 to 10
 			$key = $GLOBALS['wpdb']->prefix . 'user_level';
 			if ( $meta_key == $key ) {
-				// monitor for change of user_level
 				if ( $meta_value != $save_user['meta_user_level'] ) {
-					// @todo notify admin
-				}
-				// cannot increase user_level
-				if ( 10 == $meta_value && 10 > $save_user['meta_user_level'] ) {
-					// @todo notify admin
-					return false;
+					if ( 10 == $meta_value && 10 > $save_user['meta_user_level'] ) {
+						// @todo notify admin
+						return false;
+					} else {
+						$wpdb->update( $this->table_save_users, [ 'meta_user_level' => $meta_value ], [ 'user_id' => $object_id ] );
+					}
 				}
 			}
 
@@ -575,6 +614,8 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 				if ( $save_user['meta_use_ssl'] && ! $meta_value ) {
 					// @todo notify admin
 					return false;
+				} elseif ( $save_user['meta_use_ssl'] != $meta_value ) {
+					$wpdb->update( $this->table_save_users, [ 'meta_use_ssl' => $meta_value ], [ 'user_id' => $object_id ] );
 				}
 			}
 
@@ -714,7 +755,107 @@ if ( !class_exists( 'User_Registration_Lock' ) ) {
 			}
 
 			# read users and check for monitored or disallowed changes
-			// @todo @fixme
+			$users = get_users();
+			foreach ( $users as $user ) {
+				$meta = get_user_meta( $user->ID );
+				// these are arrays with single element:
+				$meta_capabilities = isset( $meta[ $GLOBALS['wpdb']->prefix.'capabilities' ] ) ? $meta[ $GLOBALS['wpdb']->prefix.'capabilities' ][0] : '';
+				$meta_user_level = isset( $meta[ $GLOBALS['wpdb']->prefix.'user_level' ] ) ?  $meta[ $GLOBALS['wpdb']->prefix.'user_level' ][0] : '';
+				$meta_use_ssl = isset( $meta['use_ssl'] ) ?  $meta['use_ssl'][0] : '';
+
+				$_user = [
+					'user_login' => $user->user_login,
+					'user_id' => $user->ID,
+					'user_pass' => $user->user_pass,
+					'user_email' => $user->user_email,
+					'user_registered' => $user->user_registered,
+					'user_roles' => json_encode( $user->roles ),
+					'user_caps' => json_encode( $user->caps ),
+					'user_allcaps' => json_encode( $user->allcaps ),
+					'meta_capabilities' => $meta_capabilities,
+					'meta_user_level' => $meta_user_level,
+					'meta_use_ssl' => $meta_use_ssl,
+				];
+
+				$save_user = $this->get_saved_userdata( $user->ID );
+
+				// no data saved for this user when User Registration Lock was enabled
+				if ( ! is_array( $save_user ) ) {
+					// @todo notify admin
+					continue;
+				}
+
+				$updated = false;
+
+				foreach ( [ 'user_login', 'user_id', 'user_email', 'user_registered', 'user_roles', 'user_caps', 'user_allcaps', 'meta_capabilities', 'meta_user_level' ] as $key ) {
+					if ( $_user[$key] != $save_user[$key] ) {
+						// @todo notify admin
+						$save_user[$key] = $_user[$key];
+						$updated = true;
+					}
+				}
+
+				if ( $_user['user_roles'] != $save_user['user_roles'] && 'administrator' == $_user['user_roles']) {
+					// @todo notify admin
+					// @todo: add option to change the user's role back?
+					$save_user['user_roles'] = $_user['user_roles'];
+					$updated = true;
+				}
+
+				// don't deserialize, just treat as a string
+				if ( $_user['user_caps'] != $save_user['user_caps'] &&
+					( str_contains( $_user['user_caps'], '"administrator":' ) ||
+					  str_contains( $_user['user_caps'], "'administrator':" ) ) &&
+					! ( str_contains( $save_user['user_caps'], '"administrator":' ) ||
+					    str_contains( $save_user['user_caps'], "'administrator':" ) ) )
+				{
+					// @todo notify admin
+					$save_user['user_caps'] = $_user['user_caps'];
+					$updated = true;
+				}
+
+				if ( $_user['user_allcaps'] != $save_user['user_allcaps'] &&
+					( str_contains( $_user['user_allcaps'], '"administrator":' ) ||
+					  str_contains( $_user['user_allcaps'], "'administrator':" ) ) &&
+					! ( str_contains( $save_user['user_allcaps'], '"administrator":' ) ||
+					    str_contains( $save_user['user_allcaps'], "'administrator':" ) ) )
+				{
+					// @todo notify admin
+					$save_user['user_allcaps'] = $_user['user_allcaps'];
+					$updated = true;
+				}
+
+				if ( $_user['meta_capabilities'] != $save_user['meta_capabilities'] &&
+					( str_contains( $_user['meta_capabilities'], '"administrator":' ) ||
+					  str_contains( $_user['meta_capabilities'], "'administrator':" ) ) &&
+					! ( str_contains( $save_user['meta_capabilities'], '"administrator":' ) ||
+					    str_contains( $save_user['meta_capabilities'], "'administrator':" ) ) )
+				{
+					// @todo notify admin
+					$save_user['meta_capabilities'] = $_user['meta_capabilities'];
+					$updated = true;
+				}
+
+				if ( $_user['meta_user_level'] != $save_user['meta_user_level'] && 10 == $_user['meta_user_level']) {
+					// @todo notify admin
+					$save_user['meta_user_level'] = $_user['meta_user_level'];
+					$updated = true;
+				}
+
+				if ( $save_user['meta_use_ssl'] && ! $_user['meta_use_ssl'] ) {
+					// @todo notify admin
+				}
+
+				// update save_user data
+				if ( $updated ) {
+					$this->update_saved_userdata( $save_user );
+				}
+			}
+
+			# @todo: read save_users and check for any users missing ?
+
+			// update last_run timestamp
+			User_Registration_Lock_Options::update_option( 'last_run', time() );
 		}
 
 		/**
